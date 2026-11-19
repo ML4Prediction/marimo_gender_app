@@ -5,8 +5,8 @@ format:
     embed-resources: true
 ---
 
-We train a neural network **without hidden layers** to predict gender from a face photo,
-and save it so the marimo app in `./` can use it.
+We train a neural network **without hidden layers** to predict FairFace's gender label
+from a face photo, and save it so the marimo app in this folder can use it.
 
 ```{r}
 library(keras3)
@@ -17,15 +17,33 @@ set_random_seed(2026)
 
 [FairFace](https://github.com/joojs/fairface): face photos (224 x 224 pixels) labelled with
 gender (0 = male, 1 = female), balanced across 7 race groups. To keep memory use low we use
-the first half of the training set (43,372 photos) and the validation set (10,954 photos).
-The files are saved in `data/`.
+the first half of the training set (43,372 photos) and the released validation set
+(10,954 photos). The files are saved in `data/`.
+
+We use these files to create three sets.
+
+| Set | Source | Purpose |
+| --- | --- | --- |
+| Training | 80% of the training file | Estimate model weights |
+| Validation | Remaining 20% of the training file | Compare architectures, hyperparameters and thresholds |
+| Held-out evaluation | Released validation file | Report the selected model's overall and subgroup performance |
+
+Holding out data from model selection reduces the risk of reporting overly optimistic
+results. The released validation file is a convenient choice for the final evaluation.
+You can also construct your own training, validation and test splits.
+
+Audit fairness throughout development. Use the training and validation subsets to
+explore representation and error rates, and examine definitions, privacy and long-term
+effects from the start. After choosing the model and threshold, use the held-out set
+for the final performance and fairness estimates. Further changes informed by those
+results make that set part of model development.
 
 ```{r}
 options(timeout = 3600) # ~310 MB in total
 url <- "https://huggingface.co/datasets/HuggingFaceM4/FairFace/resolve/main/0.25/"
 files <- c(
   train = "train-00000-of-00002-d405faba4f4b9b85.parquet",
-  val   = "validation-00000-of-00001-951dbd63c8724ee1.parquet"
+  audit = "validation-00000-of-00001-951dbd63c8724ee1.parquet"
 )
 dir.create("data", showWarnings = FALSE)
 for (f in files) {
@@ -38,20 +56,27 @@ Each shrunk photo is stored as a float32 tensor (4 bytes per number instead of R
 photos fit in ~0.7 GB and `fit()` can use them without copying.
 
 ```{r}
+#' Average each k x k block of an RGB image.
 shrink <- function(img, k = 7) {
   n <- nrow(img) / k
   blocks <- aperm(array(img, c(k, n, k, n, 3)), c(1, 3, 2, 4, 5))
   colMeans(blocks, dims = 2)
 }
 
-read_faces <- function(file) {
-  df <- arrow::read_parquet(file.path("data", file))
+#' Decode a FairFace table into float32 image tensors and gender labels.
+read_faces <- function(df) {
   photos <- lapply(df$image$bytes, \(b) op_convert_to_tensor(shrink(jpeg::readJPEG(b)), "float32"))
   list(x = op_stack(photos), y = df$gender)
 }
 
-train <- read_faces(files["train"])
-val <- read_faces(files["val"])
+train_data <- arrow::read_parquet(file.path("data", files["train"]))
+set.seed(2026)
+validation_rows <- sample.int(nrow(train_data), size = floor(0.2 * nrow(train_data)))
+train <- read_faces(train_data[-validation_rows, ])
+val <- read_faces(train_data[validation_rows, ])
+rm(train_data)
+
+c(training = length(train$y), validation = length(val$y))
 op_shape(train$x)
 ```
 
@@ -75,6 +100,12 @@ model |> compile(
 model
 ```
 
+## Train and inspect validation performance
+
+This baseline uses a fixed learning rate and 30 epochs. Compare training and validation
+loss to assess overfitting. Use the validation subset when deciding which settings to
+try or whether to add early stopping.
+
 ```{r}
 history <- model |> fit(
   train$x, train$y,
@@ -83,7 +114,58 @@ history <- model |> fit(
   verbose = 2
 )
 plot(history)
-model |> evaluate(val$x, val$y, verbose = 0)
+```
+
+::: {.callout-note}
+## Optional tuning with Optuna
+
+Optuna is a Python library that tries hyperparameter settings and compares their
+results. The R package `reticulate` lets you import it and call its functions from R.
+The code below illustrates the connection and has execution disabled.
+
+Install `optuna` in the Python environment used by `keras3` before trying this extension.
+`py_config()` shows which environment R uses. If you select an environment with
+`use_virtualenv()` or `use_python()`, do so before loading Keras.
+
+```{r}
+#| eval: false
+reticulate::py_config()
+optuna <- reticulate::import("optuna")
+```
+
+For your MLP, the tuning procedure would be as follows.
+
+1. Write an R function `objective(trial)` that builds a fresh model for each trial.
+   Use methods such as `trial$suggest_int()` for the number of hidden layers or units,
+   and `trial$suggest_float()` for the learning rate.
+2. Train each trial on `train` and return a validation metric calculated on `val`.
+   For example, return validation loss and minimise it. Explain why the metric fits
+   your objective.
+3. Create a study with `optuna$create_study(direction = "minimize")` and call its
+   `optimize()` method with your objective and a trial budget, such as `n_trials = 20L`.
+   The `L` supplies the integer Python expects.
+4. Inspect `study$best_params`, train the selected configuration, and evaluate it on
+   the held-out set after fixing the model and threshold. Keep that set outside the
+   objective function.
+
+This notebook fits the fixed logistic-regression baseline shown above.
+[Calling Python from R](https://rstudio.github.io/reticulate/articles/calling_python.html)
+and [Optuna's introductory tutorial](https://optuna.readthedocs.io/en/stable/tutorial/10_key_features/001_first.html)
+provide further examples.
+:::
+
+## Held-out evaluation
+
+Once the model and decision rule have been chosen, load the released validation file
+and evaluate the selected model. Keep the `race` and `age` columns in `audit_data`
+available for the subgroup analysis in the take-home exercise. Its classification
+errors are measured against FairFace's labels. Relating these errors to screening
+eligibility is a question for the audit.
+
+```{r}
+audit_data <- arrow::read_parquet(file.path("data", files["audit"]))
+audit <- read_faces(audit_data)
+model |> evaluate(audit$x, audit$y, verbose = 0)
 ```
 
 ## Save
